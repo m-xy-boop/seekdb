@@ -233,6 +233,23 @@ private:
 class ObAIFuncJsonUtils 
 {
 public:
+  static ObJsonNode *get_value(ObIJsonBase *node, const ObString &key)
+  {
+    return node != nullptr && node->json_type() == ObJsonNodeType::J_OBJECT
+        ? static_cast<ObJsonObject *>(node)->get_value(key) : nullptr;
+  }
+  static ObJsonNode *get_value(ObIJsonBase *node, int64_t index)
+  {
+    return node != nullptr && node->json_type() == ObJsonNodeType::J_ARRAY
+        && index >= 0 && index < node->element_count()
+        ? static_cast<ObJsonArray *>(node)->get_value(index) : nullptr;
+  }
+  static ObString string_value(const ObIJsonBase *node)
+  {
+    return node != nullptr && node->json_type() == ObJsonNodeType::J_STRING
+        ? ObString(node->get_data_length(), node->get_data()) : ObString();
+  }
+
   ObAIFuncJsonUtils() {}
   virtual ~ObAIFuncJsonUtils() {}
   static bool ob_is_json_array_all_str(ObJsonArray* json_array);
@@ -376,7 +393,7 @@ class ObAIFuncPromptObjectUtils
 public:
   ObAIFuncPromptObjectUtils() {}
   virtual ~ObAIFuncPromptObjectUtils() {}
-  static bool is_valid_prompt_object(ObJsonObject* prompt_object);
+  static bool is_valid_prompt_object(ObIJsonBase *prompt_object);
   static int replace_all_str_args_in_template(ObIAllocator &allocator, ObJsonObject* prompt_object, ObString& replaced_prompt_str);
   static int construct_prompt_object(ObIAllocator &allocator, ObString &template_str, ObJsonArray *args_array, ObJsonObject *&prompt_object);
   static constexpr char prompt_template_key[20] = "template";
