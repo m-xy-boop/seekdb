@@ -18,6 +18,7 @@
 #define OCEANBASE_BASIC_OB_JSON_TABLE_OP_H_
 
 #include "sql/engine/ob_operator.h"
+#include "sql/engine/basic/file_scan_reader.h"
 #include "lib/charset/ob_charset.h"
 #include "common/json_type/ob_json_tree.h"
 #include "common/json_type/ob_json_base.h"
@@ -189,6 +190,7 @@ class ObJsonTableOp : public ObOperator
 public:
   ObJsonTableOp(ObExecContext &exec_ctx, const ObOpSpec &spec, ObOpInput *input)
     : ObOperator(exec_ctx, spec, input),
+      file_scan_(nullptr),
       def_root_(nullptr),
       allocator_(&exec_ctx.get_allocator()),
       is_inited_(false),
@@ -219,6 +221,10 @@ public:
                K_(col_count));
 
 private:
+  int open_file_scan();
+  int next_file_row();
+  file_sql::Scan *file_scan_;
+  std::vector<file_sql::Cell> file_row_;
   int init();
   int reset_variable();  // reset var in rescan 
   int init_data_obj(); // allocate data_ array

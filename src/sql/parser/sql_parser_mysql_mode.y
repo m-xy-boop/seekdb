@@ -497,7 +497,8 @@ END_P SET_VAR DELIMITER
 %type <node> dynamic_sampling_hint
 %type <node> skip_index_type opt_skip_index_type_list
 %type <node> vec_index_params vec_index_param vec_index_param_value opt_with_vector_index_parameters
-%type <node> json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
+%token <non_reserved_keyword> FILE_SQL_FUNCTION
+%type <node> file_sql_copy file_copy_options file_copy_option file_copy_option_list file_sql_expr file_sql_call json_table_expr unnest_expr mock_jt_on_error_on_empty jt_column_list json_table_column_def
 %type <node> json_table_ordinality_column_def json_table_exists_column_def json_table_value_column_def json_table_nested_column_def
 %type <node> opt_value_on_empty_or_error_or_mismatch opt_on_mismatch
 %type <node> table_values_clause table_values_clause_with_order_by_and_limit values_row_list row_value
@@ -555,7 +556,8 @@ opt_end_p:
 
 /* only preparable statement will set question mark size */
 stmt:
-    select_stmt             { $$ = $1; question_mark_issue($$, result); }
+    file_sql_copy { $$ = $1; }
+  | select_stmt             { $$ = $1; question_mark_issue($$, result); }
   | insert_stmt             { $$ = $1; question_mark_issue($$, result); }
   | create_table_stmt       {
     $$ = $1;
@@ -10787,8 +10789,52 @@ table_factor
 }
 ;
 
+file_copy_option:
+relation_name { malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, NULL); }
+| relation_name literal { malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $2); }
+| relation_name relation_name { malloc_non_terminal_node($$, result->malloc_pool_, T_EXPR_LIST, 2, $1, $2); }
+;
+file_copy_option_list:
+file_copy_option { $$ = $1; }
+| file_copy_option_list ',' file_copy_option { malloc_non_terminal_node($$, result->malloc_pool_, T_LINK_NODE, 2, $1, $3); }
+;
+file_copy_options:
+/* empty */ { $$ = NULL; }
+| '(' file_copy_option_list ')' { merge_nodes($$, result, T_EXPR_LIST, $2); }
+;
+file_sql_copy:
+COPY '(' select_stmt ')' TO STRING_VALUE file_copy_options
+{ malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SQL_COPY, 3, $3, $6, $7); $$->is_tree_not_param_=1; }
+| COPY relation_factor TO STRING_VALUE file_copy_options
+{
+  (void)$2;
+  ParseNode *q=NULL;
+  malloc_terminal_node(q,result->malloc_pool_,T_VARCHAR);
+  dup_expr_string(q,result,@2.first_column,@2.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SQL_COPY, 3, q, $4, $5);
+  $$->is_tree_not_param_=1;
+}
+;
+
+file_sql_call:
+FILE_SQL_FUNCTION '(' expr_list ')'
+{
+  ParseNode *name = NULL;
+  malloc_terminal_node(name, result->malloc_pool_, T_IDENT);
+  dup_expr_string(name, result, @1.first_column, @1.last_column);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FILE_SQL_EXPRESSION, 3, name, $3, NULL);
+  $$->is_tree_not_param_=1;
+}
+;
+file_sql_expr:
+file_sql_call %prec ')' { $$ = $1; }
+| file_sql_call relation_name { $$ = $1; $$->children_[2] = $2; }
+| file_sql_call AS relation_name { $$ = $1; $$->children_[2] = $3; }
+;
+
 table_factor:
-tbl_name
+file_sql_expr { $$ = $1; }
+| tbl_name
 {
   $$ = $1;
 }
@@ -12265,7 +12311,7 @@ explain_or_desc relation_factor opt_desc_column_option
   malloc_non_terminal_node($$, result->malloc_pool_, T_SHOW_COLUMNS, 4, $$, $2, NULL, $3);
 }
 
-| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL);}
+| explain_or_desc explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, 0, $2, NULL, NULL); if ($1 != NULL) {$$->children_[0]=$1; $1->value_=713;} }
 | explain_or_desc PRETTY explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY, $3, NULL, NULL);}
 | explain_or_desc PRETTY_COLOR explainable_stmt { GEN_EXPLAN_STMT($1, $$, 0, T_PRETTY_COLOR, $3, NULL, NULL);}
 
@@ -12306,8 +12352,8 @@ explain_or_desc relation_factor opt_desc_column_option
 
 explain_or_desc:
 EXPLAIN {$$ = NULL;}
-| DESCRIBE {$$ = NULL;}
-| DESC  {$$ = NULL;}
+| DESCRIBE {malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_=1;}
+| DESC  {malloc_terminal_node($$, result->malloc_pool_, T_INT); $$->value_=1;}
 ;
 
 explainable_stmt:
@@ -17491,7 +17537,8 @@ unreserved_keyword_normal { $$=$1;}
 ;
 
 unreserved_keyword_normal:
-ACCOUNT
+FILE_SQL_FUNCTION
+| ACCOUNT
 |       ACTION
 |       ACTIVE
 |       ADDDATE

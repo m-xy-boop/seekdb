@@ -190,6 +190,8 @@ public:
   virtual int inner_open() override;
   virtual int inner_close() override;
   virtual int inner_rescan() override;
+  int execute_file_copy();
+  bool file_copy_done_ = false;
   virtual int inner_get_next_row() override;
   virtual int inner_get_next_batch(const int64_t max_row_cnt) override;
   virtual void destroy() override;

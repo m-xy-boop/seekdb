@@ -5589,6 +5589,10 @@ int ObStaticEngineCG::generate_spec(ObLogJsonTable &op, ObJsonTableSpec &spec,
       }
     }
 
+    if (spec.table_type_ == OB_FILE_TABLE_TYPE) {
+      for (int64_t i=0;i<spec.cols_def_.count();++i) spec.cols_def_[i]->output_column_idx_=-1;
+    }
+
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_stmt()->get_column_size(); ++i) {
       ObExpr *rt_expr = nullptr;
       ObRawExpr* default_val = nullptr;

@@ -43,6 +43,7 @@
 #include "sql/resolver/ddl/ob_drop_database_resolver.h"
 #include "sql/resolver/ddl/ob_create_view_resolver.h"
 #include "sql/resolver/ddl/ob_explain_resolver.h"
+#include "sql/engine/basic/file_scan_reader.h"
 #include "sql/resolver/ddl/ob_create_outline_resolver.h"
 #include "sql/resolver/ddl/ob_alter_outline_resolver.h"
 #include "sql/resolver/ddl/ob_drop_outline_resolver.h"
@@ -148,6 +149,82 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
   do {                                                                        \
     ret = select_stmt_resolver_func<Ob##name##Resolver>(params_, parse_tree, stmt); \
   } while (0)
+  if(parse_tree.type_==T_FILE_SQL_COPY && parse_tree.num_child_==3) {
+    int result=OB_SUCCESS;int64_t enabled=0;
+    result=params_.session_info_->get_sys_variable_by_name(ObString("enable_file_sql"),enabled);
+    if(result!=OB_SUCCESS)return result;
+    if(!enabled){LOG_USER_ERROR(OB_NOT_SUPPORTED,"local file SQL is disabled");return OB_NOT_SUPPORTED;}
+    ParseNode *query_node=parse_tree.children_[0];ParseResult parsed;
+    if(query_node->type_==T_VARCHAR){
+      ObSqlString sql;result=sql.append_fmt("SELECT * FROM %.*s",query_node->str_len_,query_node->str_value_);
+      if(result!=OB_SUCCESS)return result;
+      ObParser parser(*params_.allocator_,params_.session_info_->get_sql_mode(),params_.session_info_->get_charsets4parser());
+      result=parser.parse(sql.string(),parsed);if(result!=OB_SUCCESS)return result;
+      query_node=parsed.result_tree_;if(query_node->type_==T_STMT_LIST)query_node=query_node->children_[0];
+    }
+    result=resolve(if_prepared,*query_node,stmt);if(result!=OB_SUCCESS)return result;
+    auto *select=static_cast<ObSelectStmt *>(stmt);
+    if(select->get_select_into()!=nullptr)return OB_NOT_SUPPORTED;
+    try {
+      file_sql::Options options;options.header=false;
+      const ParseNode *path=parse_tree.children_[1];
+      options.path.assign(path->str_value_,path->str_len_);
+      const ParseNode *opts=parse_tree.children_[2];std::set<std::string> seen;
+      for(int i=0;opts && i<opts->num_child_;++i){
+        auto *arg=opts->children_[i];auto *key=arg->children_[0];auto *val=arg->children_[1];
+        std::string name(key->str_value_,key->str_len_);std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return std::tolower(c);});
+        if(!seen.insert(name).second)throw file_sql::Error("duplicate COPY option");
+        std::string value=val && val->str_value_?std::string(val->str_value_,val->str_len_):"";
+        if(name=="header"){if(!val)options.header=true;else if(val->type_==T_BOOL)options.header=val->value_!=0;else throw file_sql::Error("invalid COPY header");}
+        else if(name=="format" && (value=="csv" || value=="CSV")){}
+        else if(name=="nullstr" && val && val->type_==T_VARCHAR)options.nullstr=value;
+        else if((name=="delimiter" || name=="delim" || name=="sep" || name=="quote" || name=="escape") && value.size()==1){
+          if(name=="quote")options.quote=value[0];else if(name=="escape")options.escape=value[0];else options.delimiter=value[0];
+        }else throw file_sql::Error("unsupported COPY option");
+      }
+      file_sql::Schema schema;
+      for(int64_t i=0;i<select->get_select_item_size();++i){auto &si=select->get_select_item(i);ObString name=si.alias_name_.empty()?si.expr_name_:si.alias_name_;schema.columns.push_back({std::string(name.ptr(),name.length()),file_sql::Type::Varchar,true});}
+      std::string config=file_sql::encode(options,schema);ObString stored;
+      result=ob_write_string(*params_.allocator_,ObString(config.size(),config.data()),stored);if(result!=OB_SUCCESS)return result;
+      void *buf=params_.allocator_->alloc(sizeof(ObSelectIntoItem));if(!buf)return OB_ALLOCATE_MEMORY_FAILED;
+      auto *into=new(buf)ObSelectIntoItem();into->into_type_=T_FILE_SQL_COPY;into->outfile_name_.set_varchar(stored);
+      select->set_select_into(into);
+    }catch(const std::exception &e){LOG_USER_ERROR(OB_INVALID_ARGUMENT,e.what());return OB_INVALID_ARGUMENT;}
+    return OB_SUCCESS;
+  }
+  if (parse_tree.type_ == T_EXPLAIN && parse_tree.num_child_ == 5 && parse_tree.children_[0] && parse_tree.children_[0]->type_ == T_INT && parse_tree.children_[0]->value_ == 713 &&
+      parse_tree.children_[4] && parse_tree.children_[4]->type_ == T_SELECT) {
+    // Resolve the query for its metadata, then return metadata via a native SELECT.
+    ObStmt *query=nullptr;
+    int result=resolve(if_prepared,*parse_tree.children_[4],query);
+    if(result!=OB_SUCCESS) return result;
+    auto *select=static_cast<ObSelectStmt *>(query);
+    ObSqlString sql;
+    for(int64_t i=0;result==OB_SUCCESS && i<select->get_select_item_size();++i) {
+      auto &item=select->get_select_item(i);
+      const char *type="VARCHAR";
+      switch(item.expr_->get_data_type()) {
+        case ObTinyIntType:type="BOOLEAN";break;case ObIntType:type="BIGINT";break;
+        case ObDoubleType:type="DOUBLE";break;case ObDateType:type="DATE";break;
+        case ObDateTimeType:type="DATETIME";break;case ObNullType:type="NULL";break;default:break;
+      }
+      if(i) result=sql.append(" UNION ALL ");
+      if(result==OB_SUCCESS) result=sql.append("SELECT CONVERT(0x");
+      ObString name=item.alias_name_.empty()?item.expr_name_:item.alias_name_;
+      for(int64_t j=0;result==OB_SUCCESS && j<name.length();++j) result=sql.append_fmt("%02x",static_cast<unsigned char>(name[j]));
+      if(result==OB_SUCCESS) result=sql.append_fmt(" USING utf8mb4) AS column_name, '%s' AS column_type, '%s' AS `null`, NULL AS `key`, NULL AS `default`, NULL AS extra",
+          type,(item.expr_->get_result_type().get_result_flag()&NOT_NULL_FLAG)?"NO":"YES");
+    }
+    if(result!=OB_SUCCESS) return result;
+    ParseResult parsed;
+    ObParser parser(*params_.allocator_,params_.session_info_->get_sql_mode(),params_.session_info_->get_charsets4parser());
+    result=parser.parse(sql.string(),parsed);
+    if(result!=OB_SUCCESS) return result;
+    ParseNode *tree=parsed.result_tree_;
+    if(tree && tree->type_==T_STMT_LIST) tree=tree->children_[0];
+    if(!tree) return OB_ERR_UNEXPECTED;
+    return resolve(if_prepared,*tree,stmt);
+  }
   ACTIVE_SESSION_FLAG_SETTER_GUARD(in_resolve);
   int ret = OB_SUCCESS;
   const ParseNode *real_parse_tree = NULL;
