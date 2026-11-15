@@ -44,6 +44,7 @@
 #include "sql/resolver/ddl/ob_create_view_resolver.h"
 #include "sql/resolver/ddl/ob_explain_resolver.h"
 #include "sql/engine/basic/file_scan_reader.h"
+#include "sql/ai_column/ai_column_definition.h"
 #include "sql/resolver/ddl/ob_create_outline_resolver.h"
 #include "sql/resolver/ddl/ob_alter_outline_resolver.h"
 #include "sql/resolver/ddl/ob_drop_outline_resolver.h"
@@ -149,6 +150,82 @@ int ObResolver::resolve(IsPrepared if_prepared, const ParseNode &parse_tree, ObS
   do {                                                                        \
     ret = select_stmt_resolver_func<Ob##name##Resolver>(params_, parse_tree, stmt); \
   } while (0)
+  if (parse_tree.type_ == T_ALTER_TABLE && parse_tree.num_child_ >= 2 && parse_tree.children_[1]) {
+    const auto *actions = parse_tree.children_[1];
+    const ParseNode *retry = nullptr;
+    for (int i = 0; i < actions->num_child_; ++i)
+      if (actions->children_[i] && actions->children_[i]->type_ == T_AI_COLUMN_RETRY) retry = actions->children_[i];
+    if (retry) {
+      if (actions->num_child_ != 1) {
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "combining AI COLUMN RETRY with another ALTER action");
+        return OB_NOT_SUPPORTED;
+      }
+      const auto *relation = parse_tree.children_[0];
+      if (!relation || relation->num_child_ < 2 || !relation->children_[1]) return OB_ERR_UNEXPECTED;
+      const ObString current = params_.session_info_->get_database_name();
+      const std::string database = relation->children_[0] ? ai_column::text(relation->children_[0]) : std::string(current.ptr(), current.length());
+      const std::string name = ai_column::text(relation->children_[1]);
+      const std::string column_name = ai_column::text(retry->children_[0]);
+      const share::schema::ObTableSchema *table = nullptr;
+      int result = params_.schema_checker_->get_table_schema(ObString(database.size(), database.data()), ObString(name.size(), name.data()), false, table);
+      if (result != OB_SUCCESS) return result;
+      if (!table) return OB_TABLE_NOT_EXIST;
+      const auto *column = table->get_column_schema(ObString(column_name.size(), column_name.data()));
+      if (!column || !column->is_ai_column()) {
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "retrying a column that is not an AI column");
+        return OB_NOT_SUPPORTED;
+      }
+      try {
+        const auto &spec = column->get_ai_column_spec();
+        const auto definition = ai_column::Definition::decode(std::string(spec.ptr(), spec.length()));
+        const auto *state = table->get_column_schema(definition.state_column_id);
+        const auto *request = table->get_column_schema(definition.request_column_id);
+        if (!state || !request) return OB_SCHEMA_ERROR;
+        const auto quoted_name = [](const share::schema::ObColumnSchemaV2 *c) {
+          const auto &n = c->get_column_name_str();
+          return ai_column::Definition::identifier(std::string(n.ptr(), n.length()));
+        };
+        const std::string state_expr = "(CASE " + quoted_name(state) + " WHEN 1 THEN 'READY' WHEN 2 THEN 'FAILED' ELSE 'PENDING' END)";
+        const std::string predicate = ai_column::retry_predicate(ai_column::text(retry->children_[1]), state_expr);
+        const std::string query = "UPDATE " + ai_column::Definition::identifier(database) + "." + ai_column::Definition::identifier(name)
+            + " SET " + quoted_name(request) + "=UUID() " + predicate;
+        ObParser parser(*params_.allocator_, params_.session_info_->get_sql_mode(), params_.session_info_->get_charsets4parser());
+        ParseResult parsed;
+        result = parser.parse(ObString(query.size(), query.data()), parsed);
+        if (result != OB_SUCCESS) return result;
+        ParseNode *tree = parsed.result_tree_;
+        if (tree && tree->type_ == T_STMT_LIST) tree = tree->children_[0];
+        if (!tree || !params_.query_ctx_) return OB_ERR_UNEXPECTED;
+        auto &query_ctx = *params_.query_ctx_;
+        query_ctx.ai_retry_table_id_ = table->get_table_id();
+        query_ctx.ai_retry_state_id_ = definition.state_column_id;
+        query_ctx.ai_retry_request_id_ = definition.request_column_id;
+        result = resolve(if_prepared, *tree, stmt);
+        query_ctx.ai_retry_table_id_ = query_ctx.ai_retry_state_id_ = query_ctx.ai_retry_request_id_ = 0;
+        return result;
+      } catch (const std::exception &) { return OB_INVALID_ARGUMENT; }
+    }
+  }
+  if (parse_tree.type_ == T_SHOW_AI_COLUMNS) {
+    if (parse_tree.num_child_ != 1 || parse_tree.children_[0] == nullptr
+        || parse_tree.children_[0]->num_child_ < 2 || parse_tree.children_[0]->children_[1] == nullptr) return OB_ERR_UNEXPECTED;
+    const ParseNode *relation = parse_tree.children_[0];
+    const ObString current = params_.session_info_->get_database_name();
+    const std::string database = relation->children_[0] ? ai_column::text(relation->children_[0]) : std::string(current.ptr(), current.length());
+    const std::string table = ai_column::text(relation->children_[1]);
+    const std::string query = "SELECT a.column_name, a.normalized_expr, a.model_name, a.dependency_columns, "
+        "'async' AS sync_mode, a.max_retries, a.definition_version "
+        "FROM oceanbase.__all_ai_column a JOIN oceanbase.__all_table t ON a.table_id=t.table_id "
+        "JOIN oceanbase.__all_database d ON t.database_id=d.database_id WHERE d.database_name="
+        + ai_column::Definition::literal(database) + " AND t.table_name=" + ai_column::Definition::literal(table) + " ORDER BY a.column_id";
+    ObParser parser(*params_.allocator_, params_.session_info_->get_sql_mode(), params_.session_info_->get_charsets4parser());
+    ParseResult parsed;
+    int result = parser.parse(ObString(query.size(), query.data()), parsed);
+    if (result != OB_SUCCESS) return result;
+    ParseNode *tree = parsed.result_tree_;
+    if (tree && tree->type_ == T_STMT_LIST) tree = tree->children_[0];
+    return tree ? resolve(if_prepared, *tree, stmt) : OB_ERR_UNEXPECTED;
+  }
   if(parse_tree.type_==T_FILE_SQL_COPY && parse_tree.num_child_==3) {
     int result=OB_SUCCESS;int64_t enabled=0;
     result=params_.session_info_->get_sys_variable_by_name(ObString("enable_file_sql"),enabled);

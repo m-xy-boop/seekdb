@@ -386,6 +386,13 @@ int ObCreateTableResolver::resolve(const ParseNode &parse_tree)
 
       }
     }
+    if (OB_SUCC(ret)) {
+      auto &table = create_table_stmt->get_create_table_arg().schema_;
+      for (int64_t i = 0; OB_SUCC(ret) && i < table.get_column_count(); ++i) {
+        ret = validate_ai_column_dependencies(*table.get_column_schema_by_idx(i), table);
+      }
+      if (OB_SUCC(ret)) ret = add_ai_column_state_columns(table);
+    }
     if (OB_SUCC(ret)){
       if (OB_FAIL(deep_copy_string_in_part_expr(create_table_stmt))) {
       }

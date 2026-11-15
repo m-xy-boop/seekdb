@@ -342,7 +342,8 @@ all_column_def = dict(
       ('sub_data_type', 'int', 'false', '0'),
       ('skip_index_attr', 'int', 'false', '0'),
       ('lob_chunk_size', 'int', 'false', 'OB_DEFAULT_LOB_CHUNK_SIZE'),
-      ('local_session_vars', 'longtext', 'true')
+      ('local_session_vars', 'longtext', 'true'),
+      ('ai_column_spec', 'longtext', 'true')
   ]
   )
 
@@ -2447,6 +2448,8 @@ all_ai_model_endpoint_def = dict(
 def_table_schema(**all_ai_model_endpoint_def)
 
 
+
+
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',
     table_name     = '__all_objauth_mysql',
@@ -2466,6 +2469,32 @@ all_objauth_mysql_def = dict(
   )
 def_table_schema(**all_objauth_mysql_def)
 def_table_schema(**gen_history_table_def(1134, all_objauth_mysql_def))
+
+# Persisted work queue: rows are inserted in the business transaction. Workers
+# may only claim rows visible after that transaction commits.
+def_table_schema(
+    owner='seekdb', table_name='__all_ai_column_task', table_id='1140',
+    table_type='SYSTEM_TABLE', gm_columns=['gmt_create', 'gmt_modified'],
+    rowkey_columns=[('task_id', 'varchar:64')],
+    normal_columns=[
+        ('table_id', 'int', 'false'),
+        ('rowkey_predicate', 'longtext', 'false'),
+        ('column_id', 'int', 'false'),
+        ('request_id', 'varchar:64', 'false'),
+        ('definition_version', 'int', 'false'),
+        ('state', 'int', 'false', '0'),
+        ('retry_count', 'int', 'false', '0'),
+        ('max_retries', 'int', 'false', '2'),
+        ('eligible_ts', 'timestamp:6', 'false'),
+        ('lease_until', 'timestamp:6', 'true'),
+        ('lease_owner', 'varchar:64', 'true'),
+        ('input_expr', 'longtext', 'false'),
+        ('staged_result', 'longtext', 'true'),
+        ('last_error', 'varchar:2048', 'true')
+    ]
+)
+
+
 
 
 # Reserved position (placeholder before this line)
@@ -13869,6 +13898,25 @@ def_table_schema(
 # Reserved position (placeholder before this line)
 # Placeholder suggestion for this section: Use the actual view name for placeholder
 ################################################################################
+# The schema column record owns the definition, so this metadata view stays in
+# the same DDL transaction and naturally follows table/column deletion.
+def_table_schema(
+    owner='seekdb', table_name='__all_ai_column', table_id='21669',
+    table_type='SYSTEM_VIEW', gm_columns=[], rowkey_columns=[], normal_columns=[],
+    view_definition="""
+    SELECT table_id, column_id, column_name, schema_version AS definition_version,
+      json_unquote(json_extract(ai_column_spec, '$.expression')) AS normalized_expr,
+      cast(json_unquote(json_extract(ai_column_spec, '$.max_retries')) AS signed) AS max_retries,
+      json_unquote(json_extract(ai_column_spec, '$.model')) AS model_name,
+      json_extract(ai_column_spec, '$.dependencies') AS dependency_columns,
+      cast(json_unquote(json_extract(ai_column_spec, '$.state_column_id')) AS unsigned) AS state_column_id,
+      cast(json_unquote(json_extract(ai_column_spec, '$.request_column_id')) AS unsigned) AS request_column_id,
+      cast(json_unquote(json_extract(ai_column_spec, '$.result_spec_column_id')) AS unsigned) AS result_spec_column_id
+    FROM oceanbase.__all_column WHERE ai_column_spec IS NOT NULL AND length(ai_column_spec) > 0
+    """.replace('\n', ' ')
+)
+
+
 # End of MySQL System View (20000, 25000]
 ################################################################################
 ################################### Placeholder Notice ###################################

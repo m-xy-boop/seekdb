@@ -1296,6 +1296,31 @@ int ObSchemaServiceSQLImpl::get_sys_variable_schema(
     }
   }
 
+  // Existing data directories predate this optional AI-column session switch.
+  // Supply only its declared default in the runtime schema; preserve every
+  // persisted variable (including enable_file_sql) exactly as loaded above.
+  if (OB_SUCC(ret)) {
+    const ObSysVarSchema *existing = nullptr;
+    const int lookup = sys_variable_schema.get_sysvar_schema(SYS_VAR_AI_COLUMN_STRICT_READ, existing);
+    if (lookup == OB_ERR_SYS_VARIABLE_UNKNOWN) {
+      int64_t index = -1;
+      ObSysVarSchema added;
+      if (OB_FAIL(ObSysVarMeta::calc_sys_var_store_idx(SYS_VAR_AI_COLUMN_STRICT_READ, index))) {
+      } else {
+        added.set_data_type(ObSysVariables::get_type(index));
+        added.set_flags(ObSysVariables::get_flags(index));
+        added.set_schema_version(fetch_version);
+        if (OB_FAIL(added.set_name(ObSysVariables::get_name(index)))) {
+        } else if (OB_FAIL(added.set_value(ObSysVariables::get_value(index)))) {
+        } else if (OB_FAIL(added.set_min_val(ObSysVariables::get_min(index)))) {
+        } else if (OB_FAIL(added.set_max_val(ObSysVariables::get_max(index)))) {
+        } else if (OB_FAIL(added.set_info(ObSysVariables::get_info(index)))) {
+        } else if (OB_FAIL(sys_variable_schema.add_sysvar_schema(added))) {
+        }
+      }
+    } else if (lookup != OB_SUCCESS) ret = lookup;
+  }
+
   if (OB_SUCC(ret)) {
     // To avoid -5044 error, mock missed system variable schema with default value by hardcoded schema.
     for (int64_t i = 0; OB_SUCC(ret) && i < ObSysVariables::get_amount(); i++) {

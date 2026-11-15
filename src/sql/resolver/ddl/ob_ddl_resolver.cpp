@@ -17,6 +17,8 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
 #include "ob_ddl_resolver.h"
+#include "sql/ai_column/ai_column_definition.h"
+#include "share/schema/ob_ai_model_mgr.h"
 #include "data_plane/blocksstable/ob_index_block_util.h"
 #include "sql/resolver/dml/ob_dml_resolver.h"
 #include "sql/resolver/ddl/ob_index_builder_util.h"
@@ -1762,6 +1764,81 @@ int ObDDLResolver::resolve_column_name(ObColumnSchemaV2 &column,
   return ret;
 }
 
+
+int ObDDLResolver::add_ai_column_state_columns(ObTableSchema &table)
+{
+  int ret = OB_SUCCESS;
+  const int64_t user_column_count = table.get_column_count();
+  for (int64_t i = 0; OB_SUCC(ret) && i < user_column_count; ++i) {
+    auto *result = table.get_column_schema_by_idx(i);
+    if (result == nullptr || !result->is_ai_column()) continue;
+    const uint64_t result_id = result->get_column_id();
+    try {
+      auto definition = ai_column::Definition::decode(std::string(result->get_ai_column_spec().ptr(), result->get_ai_column_spec().length()));
+      if (definition.state_column_id != 0) continue;
+      uint64_t *ids[] = {&definition.state_column_id, &definition.request_column_id, &definition.result_spec_column_id};
+      const char *roles[] = {"state", "request", "result_spec"};
+      for (int j = 0; OB_SUCC(ret) && j < 3; ++j) {
+        ObColumnSchemaV2 hidden;
+        const uint64_t id = table.get_max_used_column_id() + 1;
+        const std::string name = "__ai_" + std::string(roles[j]) + "_" + std::to_string(result_id);
+        if (table.get_column_schema(ObString(name.size(), name.data())) != nullptr) {
+          ret = OB_ERR_COLUMN_DUPLICATE;
+          LOG_USER_ERROR(OB_ERR_COLUMN_DUPLICATE, static_cast<int>(name.size()), name.data());
+        } else if (OB_FAIL(hidden.set_column_name(ObString(name.size(), name.data())))) {
+        } else {
+          hidden.set_table_id(table.get_table_id()); hidden.set_column_id(id);
+          hidden.set_is_hidden(true); hidden.set_nullable(true);
+          hidden.set_data_type(j == 0 ? ObTinyIntType : j == 1 ? ObVarcharType : ObLongTextType);
+          hidden.set_data_length(j == 1 ? 64 : j == 2 ? 65536 : 1);
+          hidden.set_charset_type(j == 0 ? CHARSET_BINARY : CHARSET_UTF8MB4);
+          hidden.set_collation_type(j == 0 ? CS_TYPE_BINARY : CS_TYPE_UTF8MB4_BIN);
+          if (j == 0) {
+            ObObj pending; pending.set_tinyint(0);
+            if (OB_FAIL(hidden.set_cur_default_value(pending, false))) {
+            } else if (OB_FAIL(hidden.set_orig_default_value(pending))) {
+            }
+          }
+          if (OB_SUCC(ret)) ret = table.add_column(hidden);
+          if (OB_SUCC(ret)) { *ids[j] = id; table.set_max_used_column_id(id); }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        const std::string stored = definition.encode();
+        // Adding columns may reallocate the pointer array; reacquire by id.
+        result = table.get_column_schema(result_id);
+        if (result == nullptr) ret = OB_ERR_UNEXPECTED;
+        else ret = result->set_ai_column_spec(ObString(stored.size(), stored.data()));
+      }
+    } catch (const std::exception &e) {
+      ret = OB_INVALID_ARGUMENT; LOG_USER_ERROR(OB_INVALID_ARGUMENT, e.what());
+    }
+  }
+  return ret;
+}
+
+int ObDDLResolver::validate_ai_column_dependencies(const ObColumnSchemaV2 &column, const ObTableSchema &table)
+{
+  int ret = OB_SUCCESS;
+  if (column.is_ai_column()) {
+    try {
+      const ObString &spec = column.get_ai_column_spec();
+      const auto definition = ai_column::Definition::decode(std::string(spec.ptr(), spec.length()));
+      for (const auto &name : definition.dependencies) {
+        const auto *dependency = table.get_column_schema(ObString(name.size(), name.data()));
+        if (dependency == nullptr || dependency->is_ai_column() || dependency->is_generated_column()
+            || dependency->is_hidden() || dependency->get_column_name_str().case_compare(column.get_column_name_str()) == 0) {
+          ret = OB_NOT_SUPPORTED;
+          break;
+        }
+      }
+    } catch (const std::exception &e) {
+      ret = OB_INVALID_ARGUMENT; LOG_USER_ERROR(OB_INVALID_ARGUMENT, e.what());
+    }
+  }
+  return ret;
+}
+
 int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
                                              ParseNode *node, /* column_definition */
                                              ObColumnResolveStat &resolve_stat,
@@ -1964,6 +2041,62 @@ int ObDDLResolver::resolve_column_definition(ObColumnSchemaV2 &column,
           }
         }
       }
+    }
+  }
+  if (OB_SUCC(ret) && node->num_child_ == 5 && node->children_[4]
+      && node->children_[4]->type_ == T_AI_COLUMN_DEFINITION) {
+    try {
+      auto definition = ai_column::Definition::parse(*node->children_[4]);
+      if (!column.is_nullable() || column.is_autoincrement() || column.is_generated_column()
+          || !column.get_cur_default_value().is_null()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI column constraints or default values");
+      } else if (definition.function == "ai_embed") {
+        int64_t dimension = 0;
+        if (!column.is_collection()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_EMBED requires a VECTOR result column");
+        } else if (OB_FAIL(ObVectorIndexUtil::get_vector_dim_from_extend_type_info(column.get_extended_type_info(), dimension))) {
+        } else if (definition.explicit_dimension && dimension != definition.explicit_dimension) {
+          ret = OB_ERR_INVALID_VECTOR_DIM;
+          LOG_USER_ERROR(OB_ERR_INVALID_VECTOR_DIM, static_cast<unsigned>(dimension), static_cast<unsigned>(definition.explicit_dimension));
+        }
+      } else if (!(column.is_string_type() || column.is_json() || ob_is_numeric_type(column.get_data_type()))) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_COMPLETE result column type");
+      }
+      if (OB_SUCC(ret)) {
+        const ObAiModelSchema *model = nullptr;
+        if (OB_FAIL(schema_checker_->get_schema_guard()->get_ai_model_schema(
+              ObString(definition.model.size(), definition.model.data()), model))) {
+        } else if (model == nullptr) {
+          ret = OB_AI_FUNC_MODEL_NOT_FOUND;
+          LOG_USER_ERROR(OB_AI_FUNC_MODEL_NOT_FOUND, static_cast<int>(definition.model.size()), definition.model.data());
+        } else if ((definition.function == "ai_embed" && model->get_type() != EndpointType::DENSE_EMBEDDING)
+                   || (definition.function == "ai_complete" && model->get_type() != EndpointType::COMPLETION)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI column model type mismatch");
+        }
+      }
+      if (OB_SUCC(ret)) {
+        std::string prompt;
+        int64_t dimension = 0;
+        if (definition.function == "ai_embed") {
+          ret = ObVectorIndexUtil::get_vector_dim_from_extend_type_info(column.get_extended_type_info(), dimension);
+        } else if (column.is_json()) {
+          prompt = "Return exactly one valid JSON value. Do not include markdown or commentary.";
+        } else if (ob_is_integer_type(column.get_data_type())) {
+          prompt = "Return exactly one base-10 integer. Do not include markdown or commentary.";
+        } else if (ob_is_numeric_type(column.get_data_type())) {
+          prompt = "Return exactly one numeric value. Do not include markdown or commentary.";
+        }
+        if (OB_SUCC(ret)) definition.normalize(*node->children_[4]->children_[0], prompt, dimension);
+        const std::string stored = definition.encode();
+        if (OB_SUCC(ret)) ret = column.set_ai_column_spec(ObString(stored.size(), stored.data()));
+      }
+    } catch (const std::exception &e) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, e.what());
     }
   }
   return ret;

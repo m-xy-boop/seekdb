@@ -1680,6 +1680,7 @@ stmt::StmtType ObResolverUtils::get_stmt_type_by_item_type(const ObItemType item
       // dml
       SET_STMT_TYPE(T_SELECT);
       case T_FILE_SQL_COPY: type=stmt::T_SELECT;break;
+      case T_SHOW_AI_COLUMNS: type=stmt::T_SELECT;break;
       SET_STMT_TYPE(T_INSERT);
       SET_STMT_TYPE(T_DELETE);
       SET_STMT_TYPE(T_UPDATE);

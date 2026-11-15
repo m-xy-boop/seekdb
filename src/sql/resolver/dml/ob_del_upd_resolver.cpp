@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_RESV
+#include "sql/ai_column/ai_column_definition.h"
 #include "ob_del_upd_resolver.h"
 #include "sql/resolver/dml/ob_default_value_utils.h"
 #include "sql/resolver/dml/ob_update_stmt.h"
@@ -491,6 +492,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
   ObDMLStmt *stmt = get_stmt();
   bool trigger_exist = false;
   bool update_with_vector_index = false;
+  std::set<uint64_t> ai_row_columns;
   if (OB_ISNULL(params_.expr_factory_) || OB_ISNULL(stmt)) {
     ret = OB_NOT_INIT;
     LOG_WARN("params is invalid", K_(params_.expr_factory), K(stmt));
@@ -518,6 +520,59 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                                                  assigns.at(i).assignments_,
                                                                  update_with_vector_index))) {
     } else {
+      ai_row_columns.clear();
+      if (session_info_->is_user_session()) {
+        try {
+          for (auto iter = table_schema->column_begin(); iter != table_schema->column_end(); ++iter) {
+            const auto *column = *iter;
+            if (!column->is_ai_column()) continue;
+            for (const auto &assignment : assigns.at(i).assignments_) {
+              if (!assignment.is_implicit_ && assignment.column_expr_->get_column_id() == column->get_column_id()) {
+                ret = OB_NOT_SUPPORTED;
+                LOG_USER_ERROR(OB_NOT_SUPPORTED, "direct assignment to an AI column");
+                break;
+              }
+            }
+            const auto &spec = column->get_ai_column_spec();
+            const auto definition = ai_column::Definition::decode(std::string(spec.ptr(), spec.length()));
+            // Dependency invalidation updates an indexed AI vector even though
+            // the user's assignment names its input rather than the vector.
+            // Include the native generated VID assignment in that update.
+            bool invalidates_vector = false;
+            for (const auto &assignment : assigns.at(i).assignments_) {
+              const uint64_t changed_id = assignment.column_expr_->get_column_id();
+              invalidates_vector |= changed_id == definition.request_column_id;
+              for (int64_t k = 0; k < table_schema->get_rowkey_info().get_size(); ++k)
+                invalidates_vector |= changed_id == table_schema->get_rowkey_info().get_column(k)->column_id_;
+              for (const auto &name : definition.dependencies) {
+                const auto *dep = table_schema->get_column_schema(ObString(name.size(),name.data()));
+                invalidates_vector |= dep && dep->get_column_id() == changed_id;
+              }
+            }
+            if (invalidates_vector && !update_with_vector_index) {
+              ObIndexType index_type = INDEX_TYPE_MAX;
+              if (OB_FAIL(ObVectorIndexUtil::check_column_has_vector_index(*table_schema,
+                      *schema_guard, column->get_column_id(), update_with_vector_index, index_type))) break;
+            }
+            ai_row_columns.insert(column->get_column_id());
+            ai_row_columns.insert(definition.state_column_id);
+            ai_row_columns.insert(definition.request_column_id);
+            ai_row_columns.insert(definition.result_spec_column_id);
+            for (const auto &name : definition.dependencies) {
+              const auto *dependency = table_schema->get_column_schema(ObString(name.size(), name.data()));
+              if (dependency == nullptr) ret = OB_SCHEMA_ERROR;
+              else ai_row_columns.insert(dependency->get_column_id());
+            }
+          }
+          // Keep the user's existing dependency assignments. Only synthesize
+          // self-assignments for columns not already included in the update.
+          for (const auto &assignment : assigns.at(i).assignments_) {
+            ai_row_columns.erase(assignment.column_expr_->get_column_id());
+          }
+        } catch (const std::exception &) {
+          ret = OB_INVALID_ARGUMENT;
+        }
+      }
       for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
           (OB_SUCCESS == ret && iter != table_schema->column_end()); ++iter) {
         ColumnItem *col_item = NULL;
@@ -538,6 +593,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                             ((column_schema->is_vec_hnsw_vid_column() ||
                                               column_schema->is_vec_ivf_center_id_column()) && 
                                              (update_with_vector_index || T_INSERT_SCOPE == scope)))) {
+        } else if (FALSE_IT(need_assigned = need_assigned || ai_row_columns.count(column_id) != 0)) {
         } else if (need_assigned) {
           // for insert scope, on duplicate key update column list already
           // exists in insert list, therefore, only need to add assignment.
@@ -563,6 +619,8 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                            col_item->expr_->get_dependant_expr(),
                                            assignment.expr_))) {
               }
+            } else if (ai_row_columns.count(column_id) != 0) {
+              assignment.expr_ = col_item->expr_;
             } else if (trigger_exist) {
               assignment.expr_ = col_item->expr_;
             }
@@ -573,6 +631,8 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                                                       *col_item->get_expr(),
                                                                       assignment.expr_,
                                                                       session_info_))) {
+            } else if (ai_row_columns.count(column_id) != 0 &&
+                      OB_FAIL(ObRawExprUtils::build_wrapper_inner_expr(*params_.expr_factory_, *session_info_, assignment.expr_, assignment.expr_))) {
             } else if (trigger_exist &&
                       OB_FAIL(ObRawExprUtils::build_wrapper_inner_expr(*params_.expr_factory_, *session_info_, assignment.expr_, assignment.expr_))) {
             } else {
@@ -2009,6 +2069,9 @@ int ObDelUpdResolver::build_column_conv_function_with_default_expr(ObInsertTable
                                                                   *params_.allocator_,
                                                                   *column_item->get_expr(),
                                                                   expr, session_info_))) {
+        } else if ((col_schema->is_ai_column() || (col_schema->is_hidden()
+                       && col_schema->get_column_name_str().prefix_match(ObString("__ai_")))) &&
+                  OB_FAIL(ObRawExprUtils::build_wrapper_inner_expr(*params_.expr_factory_, *session_info_, expr, expr))) {
         } else if (trigger_exist &&
                   OB_FAIL(ObRawExprUtils::build_wrapper_inner_expr(*params_.expr_factory_, *session_info_, expr, expr))) {
         } else {
@@ -2205,6 +2268,21 @@ int ObDelUpdResolver::resolve_insert_columns(const ParseNode *node,
     }
   }
 
+  if (OB_SUCC(ret) && node != nullptr && session_info_->is_user_session() && table_item->is_basic_table()) {
+    const ObTableSchema *ai_table = nullptr;
+    if (OB_FAIL(schema_checker_->get_table_schema(table_item->ref_id_, ai_table))) {
+    } else if (ai_table == nullptr) {
+      ret = OB_SCHEMA_ERROR;
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < table_info.values_desc_.count(); ++i) {
+        const auto *column = ai_table->get_column_schema(table_info.values_desc_.at(i)->get_column_id());
+        if (column != nullptr && column->is_ai_column()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "direct assignment to an AI column");
+        }
+      }
+    }
+  }
   if (OB_SUCC(ret) && (table_item->is_generated_table() || table_item->is_temp_table())) {
     FOREACH_CNT_X(desc, table_info.values_desc_, OB_SUCC(ret)) {
       const ColumnItem *column_item = del_upd_stmt->get_column_item_by_id(

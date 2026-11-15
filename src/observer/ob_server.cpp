@@ -99,6 +99,7 @@ int ObServer::get_lower_bound_freeze_info(const int64_t snapshot_version, share:
 #include "rpc/ob_request.h"
 #include "storage/blocksstable/ob_block_sstable_struct.h"
 #include "standby/standby_module.h"
+#include "sql/ai_column/ai_column_worker.h"
 
 using namespace oceanbase::lib;
 using namespace oceanbase::common;
@@ -111,6 +112,14 @@ namespace
 {
 
 using StandbyModule = standby::StandbyModule;
+
+sql::ai_column::Worker &ai_column_worker()
+{
+  // ObServer owns one process-wide SQL service. Stop this worker before
+  // tearing down its proxy, schema service or runtime context.
+  static sql::ai_column::Worker worker;
+  return worker;
+}
 
 int set_bootstrap_parameter(const char *name, const char *value)
 {
@@ -1335,6 +1344,9 @@ int ObServer::start()
       LOG_ERROR("fail to start standby gRPC service", KR(ret));
     }
 
+  if (OB_SUCC(ret) && !stop_ && OB_FAIL(ai_column_worker().start_with(sql_proxy_))) {
+    LOG_ERROR("failed to start AI column worker", KR(ret));
+  }
   int64_t start_service_time = ObTimeUtility::current_time();
   if (OB_FAIL(ret)) {
     LOG_ERROR("failure occurs, stop observer startup", KR(ret));
@@ -1553,6 +1565,9 @@ int ObServer::stop()
   int fail_ret = OB_SUCCESS;
   FLOG_INFO("[OBSERVER_NOTICE] stop observer begin");
   LOG_DBA_INFO_V2(OB_SERVER_STOP_BEGIN, "observer stop begin.");
+
+  ai_column_worker().stop();
+  ai_column_worker().wait();
 
   if (in_process_) {
     // DDL retries must observe cancellation while schema and SQL services are still available.

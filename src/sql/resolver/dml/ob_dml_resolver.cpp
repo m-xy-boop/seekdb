@@ -1837,6 +1837,15 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
   ObColumnRefRawExpr *col_expr = NULL;
   ObSchemaGetterGuard *schema_guard = NULL;
   ColumnItem column_item;
+  // Only the internal RETRY rewrite may name its two hidden control columns.
+  if (params_.query_ctx_ && table_item.ref_id_ == params_.query_ctx_->ai_retry_table_id_) {
+    const ObTableSchema *retry_table = nullptr;
+    const int lookup = schema_checker_->get_table_schema(table_item.ref_id_, retry_table);
+    if (lookup != OB_SUCCESS) return lookup;
+    const auto *column = retry_table ? retry_table->get_column_schema(column_name) : nullptr;
+    if (column && (column->get_column_id() == params_.query_ctx_->ai_retry_state_id_
+        || column->get_column_id() == params_.query_ctx_->ai_retry_request_id_)) include_hidden = true;
+  }
   if (NULL == stmt) {
     stmt = get_stmt();
   }
@@ -1958,6 +1967,22 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
       } else if (OB_FAIL(col_expr->pull_relation_id())) {
       } else {
         col_item = stmt->get_column_item(stmt->get_column_size() - 1);
+      }
+    }
+  }
+  // Most user expressions bind through namespace resolution directly into
+  // this method, bypassing resolve_column_ref_expr(). Do not count columns
+  // introduced later solely to construct an UPDATE/DELETE row image.
+  if (OB_SUCC(ret) && col_item && (is_select_resolver() || current_scope_ == T_WHERE_SCOPE)) {
+    const ObTableSchema *table = nullptr;
+    if (OB_FAIL(schema_checker_->get_table_schema(table_item.ref_id_, table))) {
+    } else if (table) {
+      const auto *column = table->get_column_schema(col_item->column_id_);
+      if (column && column->is_ai_column()) {
+        auto &reads = stmt->get_query_ctx()->ai_column_reads_;
+        if (OB_FAIL(reads.push_back(table->get_table_id()))) {
+        } else if (OB_FAIL(reads.push_back(column->get_column_id()))) {
+        }
       }
     }
   }
@@ -2248,6 +2273,23 @@ int ObDMLResolver::resolve_column_ref_expr(const ObQualifiedName &q_name, ObRawE
   int ret = OB_SUCCESS;
   if (OB_FAIL(resolve_table_column_expr(q_name, real_ref_expr))) {
     LOG_WARN_IGNORE_COL_NOTFOUND(ret, "resolve table column failed", K(q_name), K(ret));
+  }
+  if (OB_SUCC(ret) && real_ref_expr != nullptr && real_ref_expr->is_column_ref_expr()) {
+    const auto *ref = static_cast<ObColumnRefRawExpr *>(real_ref_expr);
+    const auto *item = get_stmt()->get_table_item_by_id(ref->get_table_id());
+    const ObTableSchema *table = nullptr;
+    if (item && item->is_basic_table()) {
+      if (OB_FAIL(schema_checker_->get_table_schema(item->ref_id_, table))) {
+      } else if (table) {
+        const auto *col = table->get_column_schema(ref->get_column_id());
+        if (col && col->is_ai_column()) {
+          auto &reads = get_stmt()->get_query_ctx()->ai_column_reads_;
+          if (OB_FAIL(reads.push_back(table->get_table_id()))) {
+          } else if (OB_FAIL(reads.push_back(col->get_column_id()))) {
+          }
+        }
+      }
+    }
   }
   return ret;
 }
@@ -5120,6 +5162,13 @@ int ObDMLResolver::resolve_all_basic_table_columns(const TableItem &table_item, 
         } else if (OB_FAIL(resolve_basic_column_item(table_item, column_schema->get_column_name_str(),
                                                      include_hidden, col_item))) {
         } else if (column_items != NULL) {
+          if (is_select_resolver() && column_schema->is_ai_column()) {
+            auto &reads = get_stmt()->get_query_ctx()->ai_column_reads_;
+            if (OB_FAIL(reads.push_back(table_schema->get_table_id()))) {
+            } else if (OB_FAIL(reads.push_back(column_schema->get_column_id()))) {
+            }
+          }
+          if (OB_FAIL(ret)) break;
           if (OB_FAIL(column_items->push_back(*col_item))) {
           }
         }

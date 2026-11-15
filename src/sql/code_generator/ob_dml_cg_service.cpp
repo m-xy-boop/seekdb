@@ -2105,6 +2105,17 @@ int ObDmlCgService::generate_dml_base_ctdef(ObLogicalOperator &op,
     } else {
       dml_base_ctdef.is_table_without_pk_ = is_heap_table;
     }
+    const ObTableSchema *ai_table = nullptr;
+    if (OB_SUCC(ret) && OB_FAIL(cg_.opt_ctx_->get_schema_guard()->get_table_schema(index_dml_info.ref_table_id_, ai_table))) {
+    } else if (OB_SUCC(ret) && ai_table != nullptr) {
+      for (int64_t i = 0; i < ai_table->get_column_count(); ++i) {
+        if (ai_table->get_column_schema_by_idx(i)->is_ai_column()) {
+          cg_.phy_plan_->set_has_nested_sql(true);
+          cg_.phy_plan_->set_need_serial_exec(true);
+          break;
+        }
+      }
+    }
   }
 
   if (OB_SUCC(ret) &&

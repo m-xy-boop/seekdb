@@ -550,6 +550,9 @@ public:
 struct ObQueryCtx
 {
 public:
+  // Explicit AI-column references collected before optimizer rewrites.
+  common::ObSEArray<uint64_t, 8> ai_column_reads_;
+  uint64_t ai_retry_table_id_ = 0, ai_retry_state_id_ = 0, ai_retry_request_id_ = 0;
   ObQueryCtx()
     : question_marks_count_(0),
       calculable_items_(),
@@ -594,6 +597,8 @@ public:
 
   void reset()
   {
+    ai_column_reads_.reset();
+    ai_retry_table_id_ = ai_retry_state_id_ = ai_retry_request_id_ = 0;
     question_marks_count_ = 0;
     calculable_items_.reset();
     fetch_cur_time_ = true;

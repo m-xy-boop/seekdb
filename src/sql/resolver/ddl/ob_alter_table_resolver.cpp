@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "config_bridge.h"
+#include "sql/ai_column/ai_column_definition.h"
 #include "sql/resolver/ddl/ob_alter_table_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_part_expr_checker.h"
 #include "sql/resolver/dml/ob_delete_resolver.h"
@@ -237,6 +238,91 @@ int ObAlterTableResolver::resolve(const ParseNode &parse_tree)
     }
   }
   DEBUG_SYNC(HANG_BEFORE_RESOLVER_FINISH);
+  if (OB_SUCC(ret) && table_schema_ != nullptr) {
+    auto *stmt = get_alter_table_stmt();
+    auto &alter = stmt->get_alter_table_schema();
+    bool has_new_ai = false;
+    const int64_t count = alter.get_column_count();
+    for (int64_t i = 0; i < count; ++i) {
+      const auto *c = static_cast<const AlterColumnSchema *>(alter.get_column_schema_by_idx(i));
+      if ((c->alter_type_ == OB_DDL_ADD_COLUMN || c->alter_type_ == OB_DDL_MODIFY_COLUMN)
+          && c->is_ai_column()) has_new_ai = true;
+    }
+    if (has_new_ai) {
+      ObTableSchema combined;
+      if (OB_FAIL(combined.assign(*table_schema_))) {
+      } else {
+        uint64_t next_id = combined.get_max_used_column_id();
+        for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+          auto *c = static_cast<AlterColumnSchema *>(alter.get_column_schema_by_idx(i));
+          if (c->alter_type_ == OB_DDL_MODIFY_COLUMN && c->is_ai_column()) {
+            auto *existing = combined.get_column_schema(c->get_column_id());
+            if (existing == nullptr) {
+              ret = OB_ERR_UNEXPECTED;
+            } else {
+              try {
+                auto definition = ai_column::Definition::decode(std::string(c->get_ai_column_spec().ptr(), c->get_ai_column_spec().length()));
+                if (existing->is_ai_column()) {
+                  const auto previous = ai_column::Definition::decode(std::string(existing->get_ai_column_spec().ptr(), existing->get_ai_column_spec().length()));
+                  definition.state_column_id = previous.state_column_id;
+                  definition.request_column_id = previous.request_column_id;
+                  definition.result_spec_column_id = previous.result_spec_column_id;
+                }
+                const std::string stored = definition.encode();
+                if (OB_FAIL(c->set_ai_column_spec(ObString(stored.size(), stored.data())))) {
+                } else {
+                  // MODIFY does not carry physical linked-column order from
+                  // the existing schema. Keep it when building the combined
+                  // schema used to append the three hidden columns.
+                  c->set_prev_column_id(existing->get_prev_column_id());
+                  c->set_next_column_id(existing->get_next_column_id());
+                  ret = existing->assign(*c);
+                }
+              } catch (const std::exception &e) {
+                ret = OB_INVALID_ARGUMENT;
+                LOG_USER_ERROR(OB_INVALID_ARGUMENT, e.what());
+              }
+            }
+          } else if (c->alter_type_ != OB_DDL_ADD_COLUMN) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "mixing AI column addition with other ALTER actions");
+          } else {
+            ObColumnSchemaV2 added;
+            if (OB_FAIL(added.assign(*c))) {
+            } else {
+              added.set_column_id(++next_id);
+              ret = combined.add_column(added);
+              combined.set_max_used_column_id(next_id);
+            }
+          }
+        }
+        const uint64_t last_user_id = next_id;
+        for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+          const auto *c = alter.get_column_schema_by_idx(i);
+          const auto *resolved = combined.get_column_schema(c->get_column_name_str());
+          if (resolved == nullptr) ret = OB_ERR_UNEXPECTED;
+          else ret = validate_ai_column_dependencies(*resolved, combined);
+        }
+        if (OB_SUCC(ret)) ret = add_ai_column_state_columns(combined);
+        for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+          auto *c = alter.get_column_schema_by_idx(i);
+          const auto *resolved = combined.get_column_schema(c->get_column_name_str());
+          if (resolved == nullptr) ret = OB_ERR_UNEXPECTED;
+          else if (c->is_ai_column()) ret = c->set_ai_column_spec(resolved->get_ai_column_spec());
+        }
+        for (uint64_t id = last_user_id + 1; OB_SUCC(ret) && id <= combined.get_max_used_column_id(); ++id) {
+          AlterColumnSchema hidden;
+          const auto *c = combined.get_column_schema(id);
+          if (c == nullptr) ret = OB_ERR_UNEXPECTED;
+          else if (OB_FAIL(hidden.ObColumnSchemaV2::assign(*c))) {
+          } else {
+            hidden.alter_type_ = OB_DDL_ADD_COLUMN;
+            ret = stmt->add_column(hidden);
+          }
+        }
+      }
+    }
+  }
   return ret;
 }
 
@@ -3422,6 +3508,7 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
                                                           is_modify_column_visibility,
                                                           resolved_cols,
                                                           false))) {
+        } else if (OB_FAIL(validate_ai_column_dependencies(alter_column_schema, *table_schema_))) {
         } else if (OB_FAIL(fill_column_schema_according_stat(stat, alter_column_schema))) {
         } else if (OB_FAIL(set_column_collation(alter_column_schema))) {
         }

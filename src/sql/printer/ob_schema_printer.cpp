@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "sql/ai_column/ai_column_definition.h"
+
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "sql/printer/ob_schema_printer.h"
 #include "share/ob_autoincrement_service.h"
@@ -231,7 +233,7 @@ int ObSchemaPrinter::print_table_definition_columns(const ObTableSchema &table_s
             SHARE_SCHEMA_LOG(WARN, "fail to print geometry srid", K(ret), K(srid));
           }
         }
-        if (OB_SUCC(ret) && !col->is_generated_column()) {
+        if (OB_SUCC(ret) && !col->is_generated_column() && !col->is_ai_column()) {
           //if column is not permit null and default value does not specify , don't  display DEFAULT NULL
           if (OB_SUCC(ret)) {
             if (!(ObNullType == col->get_cur_default_value().get_type() && !col->is_nullable())
@@ -289,6 +291,16 @@ int ObSchemaPrinter::print_table_definition_columns(const ObTableSchema &table_s
           if (OB_SUCC(ret) && col->is_autoincrement() && !is_no_field_options(sql_mode)) {
             if (OB_FAIL(databuff_printf(buf, buf_len, pos, " AUTO_INCREMENT"))) {
             }
+          }
+        }
+        if (OB_SUCC(ret) && col->is_ai_column()) {
+          try {
+            const auto &spec = col->get_ai_column_spec();
+            const auto definition = sql::ai_column::Definition::decode(std::string(spec.ptr(), spec.length()));
+            ret = databuff_printf(buf, buf_len, pos, " AI COLUMN (%s) WITH (sync_mode='async', max_retries=%d)",
+                                  definition.original_expression.c_str(), definition.max_retries);
+          } catch (const std::exception &e) {
+            ret = OB_INVALID_ARGUMENT;
           }
         }
         if (OB_SUCC(ret) && OB_FAIL(print_column_lob_params(*col, buf, buf_len, pos))) {

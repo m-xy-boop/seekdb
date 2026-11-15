@@ -76,6 +76,8 @@ public:
   void set_is_last_exec_succ(bool val) { stat_.is_last_exec_succ_ = val; }
   bool is_last_exec_succ() const { return stat_.is_last_exec_succ_; }
   const ObString &get_constructed_sql() const { return stat_.constructed_sql_; }
+  // Table/column ID pairs survive plan caching and distributed serialization.
+  common::ObSEArray<uint64_t, 8> ai_column_reads_;
   bool with_rows() const
   { return ObStmt::is_select_stmt(stmt_type_) || need_drive_dml_query_; }
   //user var
